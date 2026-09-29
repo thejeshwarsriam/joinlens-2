@@ -132,7 +132,8 @@ def live_connection_ui() -> dict:
                     if not t:
                         continue
                     df = conn.sample(t, n=int(sample_n))
-                    local_name = samples.sanitize_name(t.split(".")[-1])
+                    local_name = ".".join(
+                        samples.sanitize_name(part) for part in t.split(".")[-3:])
                     tables[local_name] = df
                     try:
                         true_n = conn.row_count(t)

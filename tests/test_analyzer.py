@@ -71,6 +71,21 @@ def test_external_file_access_is_blocked():
         c.execute("SELECT * FROM read_csv('/etc/passwd')").fetchall()
 
 
+def test_qualified_live_table_names_are_queryable():
+    c = analyzer.connect({
+        "sales.orders": pd.DataFrame({"id": [1], "customer_id": [10]}),
+        "sales.customers": pd.DataFrame({"id": [10], "name": ["Ada"]}),
+    })
+    a = analyzer.analyze(
+        c,
+        "SELECT o.id FROM sales.orders o JOIN sales.customers c "
+        "ON o.customer_id = c.id",
+        "postgres",
+    )
+    assert a.driving_rows == 1
+    assert a.final_rows == 1
+
+
 def test_report_renders(con):
     a = run(con, "Revenue by region (fans out twice)")
     md = report.to_markdown(a, "SELECT 1")

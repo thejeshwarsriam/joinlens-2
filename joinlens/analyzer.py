@@ -102,8 +102,24 @@ class Analysis:
 def connect(tables: dict[str, pd.DataFrame]) -> duckdb.DuckDBPyConnection:
     """In-memory DuckDB with the given DataFrames registered as tables."""
     con = duckdb.connect(":memory:")
-    for name, df in tables.items():
-        con.register(name, df)
+    attached_catalogs: set[str] = set()
+    for index, (name, df) in enumerate(tables.items()):
+        parts = name.split(".")
+        if len(parts) in (2, 3):
+            if len(parts) == 3 and parts[0] not in attached_catalogs:
+                con.execute(f"ATTACH ':memory:' AS {_ident(parts[0])}")
+                attached_catalogs.add(parts[0])
+            stage = f"__joinlens_sample_{index}"
+            con.register(stage, df)
+            if len(parts) == 2:
+                con.execute(f"CREATE SCHEMA IF NOT EXISTS {_ident(parts[0])}")
+            else:
+                con.execute(
+                    f"CREATE SCHEMA IF NOT EXISTS {_ident(parts[0])}.{_ident(parts[1])}")
+            target = ".".join(_ident(part) for part in parts)
+            con.execute(f"CREATE VIEW {target} AS SELECT * FROM {_ident(stage)}")
+        else:
+            con.register(name, df)
     try:  # analysed SQL must never touch the local file system
         con.execute("SET enable_external_access = false")
     except duckdb.Error:
