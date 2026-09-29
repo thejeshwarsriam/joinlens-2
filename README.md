@@ -66,9 +66,12 @@ pip install -r requirements-live.txt
 ```
 
 Pick **Live connection** in the sidebar, choose a source, fill in the fields, click
-**Test connection**, then **Fetch sample**. JoinLens pulls a row-count-accurate *sample*
-of each table you list (default 50,000 rows) into a local, in-memory DuckDB and runs the
-same join engine on it as on uploaded files - nothing about the analysis logic changes.
+optionally **Test connection**, paste your query and click **Analyze joins**. JoinLens
+reads the table names from the query (CTE names excluded), pulls a *sample* of each one
+(default 50,000 rows) into a local, in-memory DuckDB and runs the same join engine on it
+as on uploaded files - nothing about the analysis logic changes. Samples are reused for
+later queries until the connection details or sample size change; tables the query parser
+misses can be added under **Fetch tables manually**.
 Once you have a result, a **"Validate final row count against full live data"** button
 re-runs your exact query's row count directly on the source (no sampling) so you can
 confirm the sample-based numbers hold on the whole table before trusting them.
@@ -114,7 +117,11 @@ pytest -q
 
 ## Limitations (v0.1)
 
-- Top-level `SELECT` with joins (CTEs and subqueries as join sources work; `UNION`, DDL, DML don't)
+- `SELECT` queries only (DDL / DML aren't supported). Each `UNION` / `EXCEPT` / `INTERSECT`
+  branch and, optionally, each CTE body is analyzed as its own section; joins inside
+  subqueries used as join sources are not broken out
+- Vendor functions DuckDB lacks are emulated case by case (currently Netezza `NEXT_MONTH`);
+  any other missing function makes that section fail with DuckDB's error
 - The detailed join diagnostics (cardinality, duplicate-key samples, verified fixes) run
   against a **sample**, not the full live table - the "validate against live data" button
   checks the final row count only, not the intermediate per-join breakdown, against full data

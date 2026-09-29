@@ -105,9 +105,7 @@ def live_connection_ui() -> dict:
         cfg_kwargs["odbc_driver"] = st.sidebar.text_input(
             "ODBC driver name", value="ODBC Driver 18 for SQL Server", key="live_odbc_driver")
 
-    tables: dict[str, pd.DataFrame] = {}
-    col1, col2 = st.sidebar.columns(2)
-    if col1.button("Test connection"):
+    if st.sidebar.button("Test connection"):
         try:
             conn = connectors.make_connector(connectors.SourceConfig(**cfg_kwargs))
             conn.test()
@@ -117,36 +115,67 @@ def live_connection_ui() -> dict:
             st.session_state["live_conn_ok"] = False
             st.sidebar.error(str(e))
 
-    table_names = st.sidebar.text_area(
-        "Tables to pull (one per line, e.g. schema.orders)", key="live_table_names",
-        help="JoinLens pulls a row-count-accurate sample of each table locally for the "
-             "join analysis, then can validate the final count against the full live data.")
-    sample_n = st.sidebar.number_input("Sample rows per table", min_value=1000, max_value=1_000_000,
-                                       value=50_000, step=1000)
-    if col2.button("Fetch sample") and table_names.strip():
-        try:
-            conn = connectors.make_connector(connectors.SourceConfig(**cfg_kwargs))
+    sample_n = st.sidebar.number_input(
+        "Sample rows per table", min_value=1000, max_value=1_000_000, value=50_000, step=1000,
+        help="Tables your query reads are sampled automatically when you click Analyze joins.")
+    # samples are reused until the connection details or the sample size change
+    cache_key = hashlib.md5(str((sorted(cfg_kwargs.items()), int(sample_n))).encode()).hexdigest()
+    if st.session_state.get("live_cache_key") != cache_key:
+        st.session_state["live_cache_key"] = cache_key
+        st.session_state["live_tables"] = {}
+        st.session_state["live_row_counts"] = {}
+        st.session_state["live_fetch_errors"] = []
+    st.session_state["live_cfg"] = cfg_kwargs
+    st.session_state["live_sample_n"] = int(sample_n)
+
+    with st.sidebar.expander("Fetch tables manually (optional)"):
+        table_names = st.text_area(
+            "Tables to pull (one per line, e.g. schema.orders)", key="live_table_names",
+            help="Only needed if a table isn't picked up from the query automatically.")
+        if st.button("Fetch sample") and table_names.strip():
+            names = [t.strip() for t in table_names.splitlines() if t.strip()]
             with st.spinner("Pulling samples..."):
-                for raw in table_names.strip().splitlines():
-                    t = raw.strip()
-                    if not t:
-                        continue
-                    df = conn.sample(t, n=int(sample_n))
-                    local_name = ".".join(
-                        samples.sanitize_name(part) for part in t.split(".")[-3:])
-                    tables[local_name] = df
-                    try:
-                        true_n = conn.row_count(t)
-                        if true_n > len(df):
-                            st.sidebar.info(f"{t}: sampled {len(df):,} of {true_n:,} rows.")
-                    except connectors.ConnectorError:
-                        pass
-            conn.close()
-            st.session_state["live_tables"] = tables
-            st.session_state["live_cfg"] = cfg_kwargs
-        except connectors.ConnectorError as e:
-            st.sidebar.error(str(e))
-    return st.session_state.get("live_tables", tables)
+                for err in fetch_live_samples(names, force=True):
+                    st.error(err)
+    return st.session_state["live_tables"]
+
+
+def live_ready() -> bool:
+    cfg = st.session_state.get("live_cfg") or {}
+    return bool(cfg.get("host"))
+
+
+def fetch_live_samples(names: list[str], force: bool = False) -> list[str]:
+    """Sample each live table not already cached into st.session_state["live_tables"].
+    Returns one error message per table that couldn't be fetched."""
+    cache = st.session_state["live_tables"]
+    todo = [t for t in names if force or live_local_name(t) not in cache]
+    if not todo:
+        return []
+    try:
+        conn = connectors.make_connector(connectors.SourceConfig(**st.session_state["live_cfg"]))
+    except connectors.ConnectorError as e:
+        return [str(e)]
+    errors = []
+    try:
+        for t in todo:
+            try:
+                df = conn.sample(t, n=st.session_state["live_sample_n"])
+            except connectors.ConnectorError as e:
+                errors.append(f"Could not fetch {t}: {e}")
+                continue
+            cache[live_local_name(t)] = df
+            try:
+                st.session_state["live_row_counts"][live_local_name(t)] = conn.row_count(t)
+            except connectors.ConnectorError:
+                pass
+    finally:
+        conn.close()
+    return errors
+
+
+def live_local_name(table: str) -> str:
+    return ".".join(samples.sanitize_name(part) for part in table.split(".")[-3:])
 
 
 # ------------------------------------------------------------------ sidebar
@@ -170,7 +199,9 @@ else:
 
 with st.sidebar.expander(f"Tables ({len(tables)})", expanded=source == "Upload files"):
     for name, df in tables.items():
-        st.markdown(f"**{name}** - {len(df):,} rows")
+        total = st.session_state.get("live_row_counts", {}).get(name) if source == "Live connection" else None
+        st.markdown(f"**{name}** - {len(df):,} rows"
+                    + (f" (sample of {total:,})" if total and total > len(df) else ""))
         st.caption(", ".join(map(str, df.columns)))
 
 st.sidebar.info("All analysis runs locally in an in-memory DuckDB. Your data isn't sent anywhere.")
@@ -188,22 +219,51 @@ else:
     default_sql, key = "SELECT ...\nFROM a\nJOIN b ON a.id = b.a_id", "sql_upload"
 sql = st.text_area("SQL (a single SELECT; CTEs are fine)", value=default_sql, height=230, key=key)
 
-sig = hashlib.md5((sql + dialect + str({k: (len(v), tuple(v.columns))
-                                        for k, v in tables.items()})).encode()).hexdigest()
-if st.button("Analyze joins", type="primary", disabled=not tables):
-    with st.spinner("Profiling each join..."):
-        try:
-            con = analyzer.connect(tables)
-            st.session_state["analysis"] = (sig, analyzer.analyze(con, sql, dialect), sql)
-        except analyzer.AnalysisError as e:
-            st.session_state["analysis"] = None
-            st.error(str(e))
-if not tables:
-    st.warning("Upload at least one table (or switch to demo data) to begin.")
+include_ctes = st.checkbox(
+    "Also analyze joins inside CTEs", value=True,
+    help="Each CTE body is measured on its own (with the CTEs defined before it). This is "
+         "usually where row multiplication starts in long queries.")
 
-state = st.session_state.get("analysis")
-if state and state[0] == sig:
-    a: analyzer.Analysis = state[1]
+
+
+def data_sig(tbls: dict[str, pd.DataFrame]) -> str:
+    shape = str({k: (len(v), tuple(v.columns)) for k, v in tbls.items()})
+    return hashlib.md5((sql + dialect + str(include_ctes) + shape).encode()).hexdigest()
+
+
+is_live = source == "Live connection"
+sig = data_sig(tables)
+if st.button("Analyze joins", type="primary", disabled=not (tables or is_live and live_ready())):
+    try:
+        if is_live:
+            names = analyzer.source_tables(sql, dialect)
+            before = len(tables)
+            with st.spinner(f"Sampling the {len(names)} table(s) your query reads..."):
+                st.session_state["live_fetch_errors"] = fetch_live_samples(names)
+            tables = st.session_state["live_tables"]
+            if not tables:
+                raise analyzer.AnalysisError("None of the tables in the query could be fetched.")
+        with st.spinner("Profiling each join..."):
+            con = analyzer.connect(tables)
+            sig = data_sig(tables)
+            st.session_state["analysis"] = (
+                sig, analyzer.analyze_query(con, sql, dialect, include_ctes=include_ctes), sql)
+        if is_live and len(tables) != before:
+            st.rerun()  # refresh the sidebar table list with the new samples
+    except analyzer.AnalysisError as e:
+        st.session_state["analysis"] = None
+        st.error(str(e))
+if is_live:
+    for err in st.session_state.get("live_fetch_errors", []):
+        st.error(err)
+if not tables and not is_live:
+    st.warning("Upload at least one table (or switch to demo data) to begin.")
+elif not tables:
+    st.info("Enter the connection details in the sidebar. The tables your query reads are "
+            "sampled automatically when you click Analyze joins.")
+
+
+def show_analysis(a: analyzer.Analysis, part_sql: str, report_md: str) -> None:
     fans = a.fanout_steps
 
     c1, c2, c3, c4 = st.columns(4)
@@ -224,7 +284,7 @@ if state and state[0] == sig:
             try:
                 conn = connectors.make_connector(connectors.SourceConfig(**st.session_state["live_cfg"]))
                 with st.spinner("Running the full query on the live source..."):
-                    true_rows = conn.query_row_count(state[2])
+                    true_rows = conn.query_row_count(part_sql)
                 conn.close()
                 st.info(f"Full live data: **{true_rows:,} rows** after all joins "
                        f"(sample-based estimate was {a.final_rows:,}).")
@@ -312,6 +372,38 @@ if state and state[0] == sig:
             st.json(llm.facts_from_analysis(a))
 
     with t_rep:
-        md = report.to_markdown(a, state[2])
-        st.download_button("Download report (.md)", md, "joinlens_report.md", "text/markdown")
-        st.markdown(md)
+        st.download_button("Download report (.md)", report_md, "joinlens_report.md", "text/markdown")
+        st.markdown(report_md)
+
+
+state = st.session_state.get("analysis")
+if state and state[0] == sig:
+    qa: analyzer.QueryAnalysis = state[1]
+    parts = qa.analyzed
+
+    if len(qa.parts) > 1:
+        st.subheader("Query sections")
+        st.dataframe(pd.DataFrame([{
+            "section": p.label,
+            "joins": len(p.analysis.steps) if p.analysis else None,
+            "joins that multiply rows": len(p.analysis.fanout_steps) if p.analysis else None,
+            "rows in → out": (f"{p.analysis.driving_rows:,} → {p.analysis.final_rows:,}"
+                              if p.analysis else "-"),
+            "note": p.error.split("\n")[0]} for p in qa.parts]), hide_index=True)
+
+    def part_label(i: int) -> str:
+        p = parts[i]
+        n = len(p.analysis.fanout_steps)
+        return f"{'🔴' if n else '🟢'} {p.label}" + (f" - {n} fan-out{'s' if n > 1 else ''}" if n else "")
+
+    if len(parts) > 1:
+        default = next((i for i, p in enumerate(parts) if p.analysis.fanout_steps), 0)
+        part = parts[st.selectbox("Section to inspect", range(len(parts)), index=default,
+                                  format_func=part_label, key=f"part_{sig}")]
+    else:
+        part = parts[0]
+    if len(qa.parts) > 1:
+        with st.expander(f"SQL analyzed for: {part.label}"):
+            st.code(part.sql, language="sql")
+
+    show_analysis(part.analysis, part.sql, report.to_markdown_query(qa, state[2]))

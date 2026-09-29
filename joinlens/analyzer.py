@@ -12,8 +12,29 @@ import duckdb
 import pandas as pd
 import sqlglot
 from sqlglot import exp
+from sqlglot.dialects.duckdb import DuckDB
 
-DUCK = "duckdb"
+# Vendor functions DuckDB lacks, emulated when a generated query is written for DuckDB.
+# The user-facing SQL (ON clauses, fix snippets) still uses the original function name.
+_EMULATED = {
+    # Netezza: first day of the month after the given date
+    "NEXT_MONTH": lambda gen, args: (
+        f"CAST(DATE_TRUNC('month', {gen.sql(args[0])}) + INTERVAL 1 MONTH AS DATE)"
+        if len(args) == 1 else None),
+}
+
+
+class JoinLensDuckDB(DuckDB):
+    class Generator(DuckDB.Generator):
+        def anonymous_sql(self, expression: exp.Anonymous) -> str:
+            emulate = _EMULATED.get(expression.name.upper())
+            out = emulate(self, expression.expressions) if emulate else None
+            return out if out is not None else super().anonymous_sql(expression)
+
+
+DUCK = JoinLensDuckDB
+WITH_KEY = "with_" if "with_" in exp.Select.arg_types else "with"
+SET_OPS = (exp.Union, exp.Except, exp.Intersect)
 SAFE_AGGS = {"min", "max", "anyvalue"}
 ORDER_HINTS = ("updated", "modified", "created", "date", "time", "_ts", "version", "seq")
 
@@ -96,6 +117,25 @@ class Analysis:
     @property
     def overall_factor(self) -> float:
         return self.final_rows / self.driving_rows if self.driving_rows else float("nan")
+
+
+@dataclass
+class Part:
+    """One SELECT that was analyzed on its own: the main query, a UNION branch or a CTE."""
+    label: str
+    sql: str                       # standalone query (with the CTEs it needs), user's dialect
+    analysis: Optional[Analysis] = None
+    error: str = ""
+
+
+@dataclass
+class QueryAnalysis:
+    dialect: str
+    parts: list[Part]
+
+    @property
+    def analyzed(self) -> list[Part]:
+        return [p for p in self.parts if p.analysis is not None]
 
 
 # --------------------------------------------------------------------------- helpers
@@ -429,14 +469,107 @@ def _grain_candidates(con, with_sql, src_node, keys, right_cols, alias_cols, ali
 
 
 # --------------------------------------------------------------------------- main
-def analyze(con: duckdb.DuckDBPyConnection, sql: str, dialect: str = "postgres") -> Analysis:
+def _parse(sql: str, dialect: str) -> exp.Expression:
     try:
-        tree = sqlglot.parse_one(sql, read=dialect)
+        return sqlglot.parse_one(sql, read=dialect)
     except sqlglot.errors.SqlglotError as e:
         raise AnalysisError(f"Could not parse the SQL as {dialect}: {e}") from e
+
+
+def analyze(con: duckdb.DuckDBPyConnection, sql: str, dialect: str = "postgres") -> Analysis:
+    """Analyze the top-level joins of a single SELECT. See analyze_query for UNIONs / CTEs."""
+    tree = _parse(sql, dialect)
     if not isinstance(tree, exp.Select):
         raise AnalysisError("Paste a single SELECT statement (CTEs are fine). "
-                            "UNION, DDL and DML are not supported.")
+                            "Use analyze_query for UNION; DDL and DML are not supported.")
+    return _analyze_select(con, tree, dialect)
+
+
+def source_tables(sql: str, dialect: str = "postgres") -> list[str]:
+    """Base tables a query reads, as written ("db.schema.table"), CTE names excluded."""
+    tree = _parse(sql, dialect)
+    cte_names = {c.alias.lower() for c in tree.find_all(exp.CTE)}
+    out: dict[str, str] = {}
+    for t in tree.find_all(exp.Table):
+        if not isinstance(t.this, exp.Identifier):  # table functions, UNNEST, ...
+            continue
+        parts = [p for p in (t.catalog, t.db, t.name) if p]
+        if len(parts) == 1 and parts[0].lower() in cte_names:
+            continue
+        name = ".".join(parts)
+        out.setdefault(name.lower(), name)
+    return list(out.values())
+
+
+def _branches(node: exp.Expression, label: str) -> list[tuple[str, exp.Select]]:
+    """The SELECTs combined by UNION / EXCEPT / INTERSECT, labelled in order."""
+    sels: list[exp.Select] = []
+
+    def walk(n):
+        while isinstance(n, exp.Subquery):
+            n = n.this
+        if isinstance(n, SET_OPS):
+            walk(n.this)
+            walk(n.expression)
+        elif isinstance(n, exp.Select):
+            sels.append(n)
+
+    walk(node)
+    if len(sels) == 1:
+        return [(label, sels[0])]
+    return [(f"{label} - UNION branch {i + 1} of {len(sels)}", s) for i, s in enumerate(sels)]
+
+
+def _with_ctes(select: exp.Select, ctes: list, recursive=None) -> exp.Select:
+    """Copy of `select` that carries `ctes` (plus any WITH of its own) so it runs standalone."""
+    q = select.copy()
+    own = q.args.get(WITH_KEY)
+    all_ctes = [c.copy() for c in ctes] + (list(own.expressions) if own is not None else [])
+    q.set(WITH_KEY, exp.With(expressions=all_ctes, recursive=recursive) if all_ctes else None)
+    return q
+
+
+def analyze_query(con: duckdb.DuckDBPyConnection, sql: str, dialect: str = "postgres",
+                  include_ctes: bool = True) -> QueryAnalysis:
+    """Analyze every SELECT with joins: each UNION branch of the main query and, optionally,
+    each CTE body. Every part runs standalone with the CTEs defined before it."""
+    tree = _parse(sql, dialect)
+    if not isinstance(tree, (exp.Select,) + SET_OPS):
+        raise AnalysisError("Paste a SELECT statement (CTEs and UNION are fine). "
+                            "DDL and DML are not supported.")
+    with_node = tree.args.get(WITH_KEY)
+    ctes = list(with_node.expressions) if with_node is not None else []
+    recursive = with_node.args.get("recursive") if with_node is not None else None
+
+    def run_part(label: str, select: exp.Select, text: Optional[str] = None) -> Part:
+        text = text or _out(select, dialect)
+        if not select.args.get("joins"):
+            return Part(label, text, error="No JOINs in this SELECT - nothing to measure.")
+        try:
+            return Part(label, text, analysis=_analyze_select(con, select, dialect))
+        except AnalysisError as e:
+            return Part(label, text, error=str(e))
+
+    main = tree.copy()
+    main.set(WITH_KEY, None)
+    branches = _branches(main, "Main query")
+    parts = [run_part(label, _with_ctes(s, ctes, recursive),
+                      sql.strip() if len(branches) == 1 else None)
+             for label, s in branches]
+    if include_ctes:
+        for n, cte in enumerate(ctes):
+            for label, s in _branches(cte.this, f"CTE {cte.alias}"):
+                if s.args.get("joins"):
+                    parts.append(run_part(label, _with_ctes(s, ctes[:n], recursive)))
+
+    if not any(p.analysis for p in parts):
+        errors = [p.error for p in parts if p.error and not p.error.startswith("No JOINs")]
+        raise AnalysisError(errors[0] if errors else
+                            "No JOINs found in the query" + (" or its CTEs." if include_ctes else "."))
+    return QueryAnalysis(dialect=dialect, parts=parts)
+
+
+def _analyze_select(con: duckdb.DuckDBPyConnection, tree: exp.Select, dialect: str) -> Analysis:
     joins = list(tree.args.get("joins") or [])
     if not joins:
         raise AnalysisError("No JOINs found in the top-level SELECT.")

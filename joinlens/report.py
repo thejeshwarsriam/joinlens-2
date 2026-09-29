@@ -1,13 +1,37 @@
 """Markdown export of an Analysis."""
 from __future__ import annotations
 
-from .analyzer import Analysis
+from .analyzer import Analysis, QueryAnalysis
 
 
 def to_markdown(a: Analysis, sql: str) -> str:
     out = ["# JoinLens report", "", "## Query", "", "```sql", sql.strip(), "```", ""]
-    out += [
-        "## Summary", "",
+    return "\n".join(out + _analysis_md(a, "##"))
+
+
+def to_markdown_query(qa: QueryAnalysis, sql: str) -> str:
+    """Report for every analyzed section (UNION branches, CTEs) of one query."""
+    if len(qa.parts) == 1 and qa.parts[0].analysis is not None:
+        return to_markdown(qa.parts[0].analysis, sql)
+    out = ["# JoinLens report", "", "## Query", "", "```sql", sql.strip(), "```", "",
+           "## Sections", "",
+           "| Section | Joins | Joins that multiply rows | Rows in -> out |",
+           "|---|---:|---:|---|"]
+    for p in qa.parts:
+        a = p.analysis
+        out.append(f"| {p.label} | {len(a.steps)} | {len(a.fanout_steps)} | "
+                   f"{a.driving_rows:,} -> {a.final_rows:,} |" if a else
+                   f"| {p.label} | - | - | {p.error.splitlines()[0] if p.error else '-'} |")
+    out.append("")
+    for p in qa.analyzed:
+        out += [f"## {p.label}", ""] + _analysis_md(p.analysis, "###")
+    return "\n".join(out)
+
+
+def _analysis_md(a: Analysis, h: str) -> list[str]:
+    sub = h + "#"
+    out = [
+        f"{h} Summary", "",
         f"- Driving table: `{a.driving_source}` ({a.driving_rows:,} rows)",
         f"- Rows after all joins: **{a.final_rows:,}** ({a.overall_factor:.2f}x)",
         f"- Joins that multiply rows: **{len(a.fanout_steps)}** of {len(a.steps)}", "",
@@ -20,16 +44,16 @@ def to_markdown(a: Analysis, sql: str) -> str:
                    f"{s.rows_after:,} | {s.factor:.2f}x{flag} | {s.cardinality} |")
     out.append("")
     for s in a.fanout_steps:
-        out += [f"## Join {s.index + 1}: {s.join_type} JOIN {s.source}", "",
+        out += [f"{h} Join {s.index + 1}: {s.join_type} JOIN {s.source}", "",
                 f"`ON {s.on_sql}`", "", s.explanation, ""]
         for f in s.fixes:
-            out += [f"### Fix: {f.title}", "", f.why, "", "```sql", f.sql, "```"]
+            out += [f"{sub} Fix: {f.title}", "", f.why, "", "```sql", f.sql, "```"]
             if f.verified_rows is not None:
                 out.append(f"\nVerified: {f.verified_rows:,} rows after this join "
                            f"({f.verified_factor:.2f}x).")
             out.append("")
     if a.agg_risks:
-        out += ["## Aggregates at risk", "",
+        out += [f"{h} Aggregates at risk", "",
                 "| Expression | Joins that inflate it | Driving-table value | After joins | Change |",
                 "|---|---|---:|---:|---:|"]
         for r in a.agg_risks:
@@ -39,4 +63,4 @@ def to_markdown(a: Analysis, sql: str) -> str:
             out.append(f"| `{r.expression}` | {', '.join(map(str, r.affected_joins))} | "
                        f"{base} | {joined} | {chg} |")
         out.append("")
-    return "\n".join(out)
+    return out

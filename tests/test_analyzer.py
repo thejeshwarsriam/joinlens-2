@@ -90,3 +90,78 @@ def test_report_renders(con):
     a = run(con, "Revenue by region (fans out twice)")
     md = report.to_markdown(a, "SELECT 1")
     assert "Fix: Pre-aggregate" in md and "Aggregates at risk" in md
+
+
+UNION_SQL = """
+WITH po AS (
+  SELECT o.order_id, o.customer_id, o.order_date, p.paid_amount
+  FROM orders o JOIN payments p ON o.order_id = p.order_id
+), plain AS (SELECT * FROM customers)
+SELECT c.region, SUM(po.paid_amount) AS paid
+FROM po JOIN plain c ON po.customer_id = c.customer_id
+GROUP BY 1
+UNION ALL
+SELECT c.region, SUM(i.qty)
+FROM orders o JOIN order_items i ON o.order_id = i.order_id
+  JOIN customers c ON c.customer_id = o.customer_id
+GROUP BY 1
+"""
+
+
+def test_union_branches_and_ctes_are_analyzed_separately(con):
+    qa = analyzer.analyze_query(con, UNION_SQL, "postgres")
+    labels = [p.label for p in qa.parts]
+    assert labels == ["Main query - UNION branch 1 of 2", "Main query - UNION branch 2 of 2",
+                      "CTE po"]  # `plain` has no joins, so it is skipped
+    b1, b2, cte = (p.analysis for p in qa.parts)
+    assert not b1.fanout_steps
+    assert [s.alias for s in b2.fanout_steps] == ["i"]
+    assert [s.alias for s in cte.fanout_steps] == ["p"]
+    assert qa.parts[1].sql.startswith("WITH po AS")  # each part runs standalone
+
+
+def test_ctes_can_be_skipped(con):
+    qa = analyzer.analyze_query(con, UNION_SQL, "postgres", include_ctes=False)
+    assert [p.label for p in qa.parts] == ["Main query - UNION branch 1 of 2",
+                                            "Main query - UNION branch 2 of 2"]
+
+
+def test_single_select_keeps_original_sql(con):
+    sql = samples.PRESET_QUERIES["Revenue by region (fans out twice)"]
+    qa = analyzer.analyze_query(con, sql, "postgres")
+    assert qa.parts[0].label == "Main query" and qa.parts[0].sql == sql.strip()
+    assert len(qa.parts[0].analysis.fanout_steps) == 2
+
+
+def test_analyze_query_errors(con):
+    with pytest.raises(analyzer.AnalysisError, match="No JOINs"):
+        analyzer.analyze_query(con, "SELECT * FROM orders UNION ALL SELECT * FROM orders", "postgres")
+    with pytest.raises(analyzer.AnalysisError, match="DDL"):
+        analyzer.analyze_query(con, "DELETE FROM orders", "postgres")
+
+
+def test_netezza_next_month_is_emulated_in_duckdb():
+    c = analyzer.connect({
+        "terms": pd.DataFrame({"id": [1, 2], "term_dt": pd.to_datetime(["2024-01-31", "2024-12-15"])}),
+        "enrolls": pd.DataFrame({"id": [1, 2], "eff_dt": pd.to_datetime(["2024-02-01", "2025-01-01"])}),
+    })
+    sql = ("SELECT t.id FROM terms t JOIN enrolls e "
+           "ON e.id = t.id AND e.eff_dt = NEXT_MONTH(t.term_dt)")
+    a = analyzer.analyze(c, sql, "postgres")
+    assert a.final_rows == 2
+    assert "NEXT_MONTH" in a.steps[0].on_sql  # shown to the user in their own dialect
+
+
+def test_query_report_has_a_section_per_part(con):
+    qa = analyzer.analyze_query(con, UNION_SQL, "postgres")
+    md = report.to_markdown_query(qa, UNION_SQL)
+    assert "## Sections" in md and "## CTE po" in md and "## Main query - UNION branch 2 of 2" in md
+
+
+def test_source_tables_skips_ctes_and_dedupes():
+    sql = """WITH pm AS (SELECT * FROM db.admin.product_map)
+             SELECT * FROM pm JOIN DB.ADMIN.PRODUCT_MAP x ON pm.id = x.id
+             LEFT JOIN (SELECT * FROM cust.admin.stg) b ON b.id = x.id
+             UNION ALL SELECT * FROM orders o JOIN pm ON o.id = pm.id"""
+    assert sorted(t.lower() for t in analyzer.source_tables(sql)) == [
+        "cust.admin.stg", "db.admin.product_map", "orders"]
