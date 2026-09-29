@@ -1,0 +1,6 @@
+# Optional: install only the drivers for the sources you actually connect to.
+-r requirements.txt
+nzpy>=1.0
+databricks-sql-connector>=3.0
+oracledb>=2.0
+pyodbc>=5.0
